@@ -99,7 +99,7 @@ void printline(unsigned char *data, int n){
 //	return;
 //}
 
-static int my_do_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+static int ng_do_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 {
 	pr_info("my_do_ioctl(%s)\n", dev->name);
 	return -1;
@@ -169,11 +169,11 @@ static int my_close(struct net_device *dev)
 static struct net_device_ops ndo = {
 	.ndo_open = my_open,
 	.ndo_stop = my_close,
-	.ndo_start_xmit = nf10_tx,
-	.ndo_do_ioctl = my_do_ioctl,
+	.ndo_start_xmit = nf10_start_xmit,
+	.ndo_do_ioctl = ng_do_ioctl,
 	.ndo_get_stats = my_get_stats,
 	.ndo_set_config = my_config,
-	.ndo_change_mtu = my_change_mtu,
+	.ndo_change_mtu = ng_change_mtu,
 };
 
 int ng_header(struct sk_buff *skb, struct net_device *dev,
@@ -190,7 +190,7 @@ int ng_header(struct sk_buff *skb, struct net_device *dev,
 }
 
 
-static void my_setup(struct net_device *dev)
+static void ng_setup(struct net_device *dev)
 {
 	//char mac_addr[mac_addr_len+1];
 	pr_info("my_setup(%s)\n", dev->name);
@@ -355,7 +355,7 @@ static void snull_hw_tx(char *buf, int len, struct net_device *dev) {
 		snull_interrupt(0, dev, NULL);
 }
 
-int nf10_tx(struct sk_buff *skb, struct net_device *dev) {
+int nf10_start_xmit(struct sk_buff *skb, struct net_device *dev) {
 	int len;
 	char *data, shortpkt[ETH_ZLEN];
 	struct nf10_priv *priv = netdev_priv(dev);
