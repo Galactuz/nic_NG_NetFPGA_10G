@@ -2,9 +2,9 @@
 ### Copyright, Jerry Cooperstein, coop@linuxfoundation.org 2/2003 - 1/2012 ####
 ### License: GPLv2 ###
 
-obj-m += ng1.o
+obj-m += NG10.o
 
-export KROOT=/lib/modules/3.15.6-200.fc20.x86_64/build
+export KROOT=/lib/modules/$(shell uname -r)/build
 
 allofit:  modules
 modules:
