@@ -53,11 +53,13 @@
 #include <linux/spinlock.h>
 #include <linux/if_ether.h>
 #include <linux/fs.h>
+ #include <linux/types.h>
 
 
 /* Driver specific definitions. */
 #include "NG10.h"
 #include "ocdp.h"
+#include "occp.h"
 
 /* Length definitions */
 //#define mac_addr_len                    6
@@ -102,6 +104,31 @@ static DEFINE_SPINLOCK(rx_dma_region_spinlock);
 /* Total size of a DMA region (1 region for TX, 1 region for RX). */
 #define     DMA_REGION_SIZE     ((DMA_BUF_SIZE + OCDP_METADATA_SIZE + sizeof(uint32_t)) * (DMA_CPU_BUFS))
 
+/* OpenCPI */
+#define WORKER_DP0 13
+#define WORKER_DP1 14
+#define WORKER_SMA0 2
+#define WORKER_BIAS 3
+#define WORKER_SMA1 4
+#define WORKER_NF10 0
+
+
+/* 2^OCCP_LOG_TIMEOUT is the number of cycles that a slave has to
+* respond to a request from a master. The significance for NF10 designs
+* is that they have this many cycles to respond to register accesses
+* across the AXI-lite interface to the design coming from OPED. */
+#define OCCP_LOG_TIMEOUT 30
+
+/* Interval at which to poll for received packets. */
+#define RX_POLL_INTERVAL 1
+
+/* Pointer to OCPI register space for the NF10 design. */
+uint32_t *nf10_regs;
+
+/* Pointer to OCPI control space for the NF10 design. */
+OccpWorkerRegisters *nf10_ctrl;
+
+
 /* Proc variables */
 struct proc_dir_entry *proc;
 int len,temp;
@@ -110,14 +137,13 @@ char *msg;
 uint32_t dma_cpu_bufs;
 uint32_t dma_region_size;
 
-
 /* Bundle of variables to keep track of a unidirectional DMA stream. */
 struct dma_stream {
-	uint8_t *buffers;
-	OcdpMetadata *metadata;
-	volatile uint32_t *flags;
-	volatile uint32_t *doorbell;
-	uint32_t buf_index;
+	uint8_t 			*buffers;
+	OcdpMetadata 		*metadata;
+	volatile uint32_t 	*flags;
+	volatile uint32_t 	*doorbell;
+	uint32_t 			buf_index;
 };
 
 
@@ -149,12 +175,27 @@ struct eth_packet {
 	u8 data[1500];
 };
 
-// static struct pci_driver eth_pci_driver = {
-//     .name       = "eth_driver: pci_driver",
-//     .id_table   = id_table,
-//     .probe      = probe,
-//     .remove     = remove,
-// };
+/* Functions prototypes up here.*/
+void Eth_teardown_pool (struct net_device* dev);
+__be16 eth_type_trans(struct sk_buff *skb, struct net_device *dev);
+int Eth_start_xmit(struct sk_buff *skb, struct net_device *dev);
+void Eth_teardown_pool (struct net_device* dev);
+static int Eth_napi_struct_poll(struct napi_struct *napi, int budget);
+void eth_release_buffer(struct eth_packet *pkt);
+void Eth_tx_timeout(struct net_device *dev);
+static void Eth_rx_ints(struct net_device *dev, int enable);
+static void remove(struct pci_dev *pdev);
+static int probe(struct pci_dev *pdev, const struct pci_device_id *id);
+static void rx_poll_timer_cb(unsigned long arg);
+
+/************************************************************/
+
+/* Variable used for keeping track of the hardware state. */
+uint32_t hw_state = 0;
+
+/* Polling timer for received packets. */
+struct timer_list rx_poll_timer = TIMER_INITIALIZER(rx_poll_timer_cb, 0, 0);
+
 
 /* These are the IDs of the PCI devices that this Ethernet driver supports. */
 static struct pci_device_id id_table[] = {
@@ -166,21 +207,12 @@ static struct pci_device_id id_table[] = {
 * /lib/modules/KVERSION/modules.pcimap file, written to by depmod. */
 MODULE_DEVICE_TABLE(pci, id_table);
 
-/* Functions prototypes up here.*/
-void Eth_teardown_pool (struct net_device* dev);
-__be16 eth_type_trans(struct sk_buff *skb, struct net_device *dev);
-int Eth_start_xmit(struct sk_buff *skb, struct net_device *dev);
-void Eth_teardown_pool (struct net_device* dev);
-static int Eth_napi_struct_poll(struct napi_struct *napi, int budget);
-void eth_release_buffer(struct eth_packet *pkt);
-void Eth_tx_timeout(struct net_device *dev);
-static void Eth_rx_ints(struct net_device *dev, int enable);
-static int probe(struct pci_dev *pdev, const struct pci_device_id *id);
-
-
-/************************************************************/
-
-
+static struct pci_driver eth_pci_driver = {
+    .name       = "eth_driver: pci_driver",
+    .id_table   = id_table,
+    .probe      = probe,
+    .remove     = remove,
+};
 
 /* DMA */
 /* *_dma_reg_* need these to be global for now since probe() and remove() both use them.
@@ -218,8 +250,21 @@ void printline(unsigned char *data, int n) {
 	pr_info("%s\n", line);
 }
 
+static void remove(struct pci_dev *pdev){
+	//PDEBUG("remove(): entering remove()\n");
+	printk(KERN_DEBUG "remove(): entering remove().\n");
+	/* FIXME: Why don't I stop the polling timer here? Right now it's in the _exit function. */
+	dma_free_coherent(&pdev->dev, dma_region_size, rx_dma_reg_va, rx_dma_reg_pa);
+	dma_free_coherent(&pdev->dev, dma_region_size, tx_dma_reg_va, tx_dma_reg_pa);
+	
+	iounmap(bar0_base_va);
+	pci_release_region(pdev, BAR_0);
+	pci_disable_device(pdev);
+}
+
+
 /* Called to fill @buf when user reads our file in /proc. */
-int read_proc(struct file *filp,char *buf,size_t count,loff_t *offp ) {
+ssize_t read_proc(struct file *filp,char *buf,size_t count,loff_t *offp ) {
 	char *data;
 	data=PDE_DATA(file_inode(filp));
 
@@ -407,7 +452,6 @@ void Eth_netdev_init(struct net_device *netdev) {
 }
 
 static int __init Eth_driver_init(void) {
-	int 		result;
 	int 		i;
 	int 		err;
 	uint32_t 	mac_addr_len;
@@ -481,6 +525,10 @@ static int __init Eth_driver_init(void) {
     /* Enabling NAPI. */
     napi_enable(&Eth_napi_struct);
 
+    /* Register the pci_driver.
+    * Note: This will succeed even without a card installed in the system. */
+    pci_register_driver(&eth_pci_driver);
+
 
 	return 0;
 }
@@ -553,8 +601,9 @@ int Eth_start_xmit(struct sk_buff *skb, struct net_device *dev) {
 	char *data, shortpkt[ETH_ZLEN];
 	struct eth_priv *priv = netdev_priv(dev);
 
-	data = skb->data;
+	data = (void*)skb->data;
 	len = skb->len;
+	
 	if (len < ETH_ZLEN) {
 		memset(shortpkt, 0 , ETH_ZLEN);
 		memcpy(shortpkt, skb->data, skb->len);
@@ -585,6 +634,22 @@ struct eth_packet *eth_dequeue_buf(struct net_device *dev) {
 	spin_unlock_irqrestore(&priv->lock, flags);
 	return pkt;
 }
+
+/* Callback function for the rx_poll_timer. */
+static void rx_poll_timer_cb(unsigned long arg){
+
+	//PDEBUG("rx_poll_timer_fn(): Timer fired\n");
+	/* Check for received packets. */
+	if(rx_dma_stream.flags[rx_dma_stream.buf_index] == 1) {
+		/* Schedule a poll. */
+		napi_schedule(&Eth_napi_struct);
+	} 
+	else {
+		rx_poll_timer.expires += RX_POLL_INTERVAL;
+		add_timer(&rx_poll_timer);
+	}
+}
+
 
  static int Eth_napi_struct_poll(struct napi_struct *napi, int budget) {
 	int npackets = 0;
@@ -734,6 +799,431 @@ void Eth_tx_timeout(struct net_device *dev) {
 	priv->stats.tx_errors++;
 	netif_wake_queue(dev);
 	return;
+}
+
+/* When the kernel finds a device with a vendor and device ID associated with this driver
+* it will invoke this function. The job of this function is really to initialize the
+* device that the kernel has already found for us... so the name 'probe' is a bit of a
+* misnomer. */
+static int probe(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+	/* OpenCPI */
+	OccpSpace *occp;
+	OcdpProperties *dp0_props;
+	OcdpProperties *dp1_props;
+	uint32_t *sma0_props;
+	uint32_t *sma1_props;
+	uint32_t *bias_props;
+	OccpWorkerRegisters
+	*dp0_regs,
+	*dp1_regs,
+	*sma0_regs,
+	*sma1_regs,
+	*bias_regs;
+	int err;
+	
+	printk(KERN_INFO "Eth_driver: Found NetFPGA-10G device with vendor_id: 0x%4x, device_id: 0x%4x\n", id->vendor, id->device);
+	
+	/* The hardware has been found. */
+	hw_state |= HW_FOUND;
+
+	/* Enable the device. pci_enable_device() will do the following (ref. PCI/pci.txt kernel doc):
+	* - wake up the device if it was in suspended state
+	* - allocate I/O and memory regions of the device (if BIOS did not)
+	* - allocate an IRQ (if BIOS did not) */
+	err = pci_enable_device(pdev);
+	
+	if(err) {
+		PDEBUG("probe(): pci_enable_device failed with error code: %d\n", err);
+		return err;
+	}
+
+	/* Enable DMA functionality for the device.
+	* pci_set_master() does this by (ref. PCI/pci.txt kernel doc) setting the bus master bit
+	* in the PCI_COMMAND register. pci_clear_master() will disable DMA by clearing the bit.
+	* This function also sets the latency timer value if necessary. */
+	pci_set_master(pdev);
+
+	/* Mark BAR0 MMIO region as reserved by this driver. */
+	err = pci_request_region(pdev, BAR_0, driver_name);
+
+	if(err) {
+		printk(KERN_ERR "%s: ERROR: probe(): could not reserve BAR0 memory-mapped I/O region\n", driver_name);
+		pci_disable_device(pdev);
+		
+		return err;
+	}
+
+	/* Remap BAR0 MMIO region into our address space. */
+	bar0_base_va = pci_ioremap_bar(pdev, BAR_0);
+	
+	if(bar0_base_va == NULL) {
+		printk(KERN_ERR "%s: ERROR: probe(): could not remap BAR0 memory-mapped I/O region into our address space\n", driver_name);
+		
+		pci_release_region(pdev, BAR_0);
+		pci_disable_device(pdev);
+		
+		/* FIXME: is this the right error code? */
+		return -ENOMEM;
+	}
+
+	/* Take note of the size. */
+	bar0_size = pci_resource_len(pdev, BAR_0);
+	
+	/* Check to make sure it's as large as we expect it to be. */
+	if(!(bar0_size >= sizeof(OccpSpace))) {
+		printk(KERN_ERR "%s: ERROR: probe(): expected BAR0 memory-mapped I/O region to be at least %lu bytes in size, but it is only %d bytes\n", driver_name, sizeof(OccpSpace), bar0_size);
+		iounmap(bar0_base_va);
+		pci_release_region(pdev, BAR_0);
+		pci_disable_device(pdev);
+		return -1;
+	}
+
+	PDEBUG("probe(): successfully mapped BAR0 MMIO region:\n"
+	"\tBAR0: Virtual address:\t\t0x%016llx\n"
+	"\tBAR0: Physical address:\t\t0x%016llx\n"
+	"\tBAR0 Size:\t\t\t%d\n",
+	
+	/* FIXME: typcasting might throw warnings on 32-bit systems... */
+	(uint64_t)bar0_base_va, (uint64_t)pci_resource_start(pdev, BAR_0), bar0_size);
+	
+	/* Negotiate with the kernel where we can allocate DMA-capable memory regions.
+	* We do this with a call to dma_set_mask. Through this function we inform
+	* the kernel of what physical memory addresses our device is capable of
+	* addressing via DMA. Through the function's return value, the kernel
+	* informs us of whether or not this machine's DMA controller is capable of
+	* supporting our request. A return value of 0 completes the "handshake" and
+	* all further DMA memory allocations will come from this region, set by the
+	* mask. */
+	err = dma_set_mask(&pdev->dev, DMA_BIT_MASK(32));
+
+	if(err) {
+		printk(KERN_ERR "%s: ERROR: probe(): this machine's DMA controller does not support the DMA address limitations of this device\n", driver_name);
+		iounmap(bar0_base_va);
+		pci_release_region(pdev, BAR_0);
+		pci_disable_device(pdev);
+		
+		return err;
+	}
+	
+	/* Since future DMA memory allocations will be coherent regions with the CPU
+	* cache, we must additionally call dma_set_coherent_mask, which performs the
+	* same negotiation process. It is guaranteed to work for a region equal to
+	* or smaller than that which we agreed upon with dma_set_mask... but we check
+	* its return value just in case. */
+	err = dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(32));
+	
+	if(err) {
+		printk(KERN_ERR "%s: ERROR: probe(): this machine's DMA controller does not support the coherent DMA address limitations of this device\n", driver_name);
+		iounmap(bar0_base_va);
+		pci_release_region(pdev, BAR_0);
+		pci_disable_device(pdev);
+		
+		return err;
+	}
+
+	for(dma_cpu_bufs = DMA_CPU_BUFS; dma_cpu_bufs >= MIN_DMA_CPU_BUFS; dma_cpu_bufs /= 2) {
+		dma_region_size = ((DMA_BUF_SIZE + OCDP_METADATA_SIZE + sizeof(uint32_t)) * dma_cpu_bufs);
+		
+		/* Allocate TX DMA region. */
+		/* Using __GFP_NOWARN flag because otherwise the kernel printk warns us when
+		* the allocation fails, which is unnecessary since we print our own msg. */
+		tx_dma_reg_va = dma_alloc_coherent(&pdev->dev, dma_region_size, &tx_dma_reg_pa, GFP_KERNEL | __GFP_NOWARN);
+		
+		if(tx_dma_reg_va == NULL) {
+			PDEBUG("probe(): failed to alloc TX DMA region of size %d bytes... trying less\n", dma_region_size);
+			/* Try smaller allocation. */
+			continue;
+		}
+		
+		/* Allocate RX DMA region. */
+		rx_dma_reg_va = dma_alloc_coherent(&pdev->dev, dma_region_size, &rx_dma_reg_pa, GFP_KERNEL | __GFP_NOWARN);
+		
+		if(rx_dma_reg_va == NULL) {
+			/* FIXME: replace all nf10_eth_driver with driver_name string in format. */
+			PDEBUG("probe(): failed to alloc RX DMA region of size %d bytes... trying less\n", dma_region_size);
+			dma_free_coherent(&pdev->dev, dma_region_size, tx_dma_reg_va, tx_dma_reg_pa);
+			/* Try smaller allocation. */
+			continue;
+		}
+
+		/* Both memory regions have been allocated successfully. */
+		break;
+		/* FIXME: Should I zero the memory? */
+		/* FIXME: Insert a check to make sure that the memory regions really are in the lower
+		* 32-bits of the address space. */
+	}
+
+	/* Check that the memory allocations succeeded. */
+	if(tx_dma_reg_va == NULL || rx_dma_reg_va == NULL) {
+		printk(KERN_ERR "nf10_eth_driver: ERROR: probe(): failed to allocate DMA regions\n");
+		iounmap(bar0_base_va);
+		pci_release_region(pdev, BAR_0);
+		pci_disable_device(pdev);
+		
+		return err;
+	}
+	
+	PDEBUG("probe(): successfully allocated the TX and RX DMA regions:\n"
+	"\tTX Region: Virtual address:\t0x%016llx\n"
+	"\tTX Region: Physical address:\t0x%016llx\n"
+	"\tTX Region Size:\t\t\t%d\n"
+	"\tRX Region: Virtual address:\t0x%016llx\n"
+	"\tRX Region: Physical address:\t0x%016llx\n"
+	"\tRX Region Size:\t\t\t%d\n",
+	
+	/* FIXME: typcasting might throw warnings on 32-bit systems... */
+	(uint64_t)tx_dma_reg_va, (uint64_t)tx_dma_reg_pa, dma_region_size,
+	(uint64_t)rx_dma_reg_va, (uint64_t)rx_dma_reg_pa, dma_region_size);
+	
+	/* Now we begin to structure the BAR0 MMIO region as the set of control and status
+	* registers that it is. Once we setup this structure, then we proceed to reset,
+	* initialize, and then start the hardware components. */
+	occp = (OccpSpace *)bar0_base_va;
+	dp0_props = (OcdpProperties *)occp->config[WORKER_DP0];
+	dp1_props = (OcdpProperties *)occp->config[WORKER_DP1];
+	sma0_props = (uint32_t *)occp->config[WORKER_SMA0];
+	sma1_props = (uint32_t *)occp->config[WORKER_SMA1];
+	bias_props = (uint32_t *)occp->config[WORKER_BIAS];
+	
+	dp0_regs = &occp->worker[WORKER_DP0].control,
+	dp1_regs = &occp->worker[WORKER_DP1].control,
+	sma0_regs = &occp->worker[WORKER_SMA0].control,
+	sma1_regs = &occp->worker[WORKER_SMA1].control,
+	bias_regs = &occp->worker[WORKER_BIAS].control;
+	
+	/* For NF10 register access and control.
+	* Please forgive my blatant violation of naming consistency. Props and regs
+	* just don't make sense for this particular context. */
+	/* Note: nf10_regs is a pointer to a 1MB register region. It is used in conjunction
+	* with a 12-bit page register in nf10_ctrl to access up to 4GB of registers. See
+	* genl_cmd_reg_rd and genl_cmd_reg_wr to see how to use these to read and write
+	* registers in an NF10 design in a 32-bit register address space. */
+	nf10_regs = (uint32_t *)occp->config[WORKER_NF10];
+	nf10_ctrl = &occp->worker[WORKER_NF10].control;
+	
+	/* Reset workers. */
+	/* Assert reset. */
+	dp0_regs->control = OCCP_LOG_TIMEOUT;
+	dp1_regs->control = OCCP_LOG_TIMEOUT;
+	sma0_regs->control = OCCP_LOG_TIMEOUT;
+	sma1_regs->control = OCCP_LOG_TIMEOUT;
+	bias_regs->control = OCCP_LOG_TIMEOUT;
+	nf10_ctrl->control = OCCP_LOG_TIMEOUT;
+
+	/* Write memory barrier. */
+	wmb();
+	/* Take out of reset. */
+	dp0_regs->control = OCCP_CONTROL_ENABLE | OCCP_LOG_TIMEOUT;
+	dp1_regs->control = OCCP_CONTROL_ENABLE | OCCP_LOG_TIMEOUT;
+	sma0_regs->control = OCCP_CONTROL_ENABLE | OCCP_LOG_TIMEOUT;
+	sma1_regs->control = OCCP_CONTROL_ENABLE | OCCP_LOG_TIMEOUT;
+	bias_regs->control = OCCP_CONTROL_ENABLE | OCCP_LOG_TIMEOUT;
+	nf10_ctrl->control = OCCP_CONTROL_ENABLE | OCCP_LOG_TIMEOUT;
+
+	/* Read/Write memory barrier. */
+	mb();
+
+	/* Initialize workers. */
+	/* FIXME: need to double check everything below for problems with ooe. */
+	if(dp0_regs->initialize != OCCP_SUCCESS_RESULT) {
+		printk(KERN_ERR "%s: ERROR: probe(): OpenCPI worker initialization failure for DP0 worker\n", driver_name);
+		err = -1;
+	}
+
+	if(dp1_regs->initialize != OCCP_SUCCESS_RESULT) {
+		printk(KERN_ERR "%s: ERROR: probe(): OpenCPI worker initialization failure for DP1 worker\n", driver_name);
+		err = -1;
+	}
+
+	if(sma0_regs->initialize != OCCP_SUCCESS_RESULT) {
+		printk(KERN_ERR "%s: ERROR: probe(): OpenCPI worker initialization failure for SMA0 worker\n", driver_name);
+		err = -1;
+	}
+
+	if(sma1_regs->initialize != OCCP_SUCCESS_RESULT) {
+		printk(KERN_ERR "%s: ERROR: probe(): OpenCPI worker initialization failure for SMA1 worker\n", driver_name);
+		err = -1;
+	}
+
+	if(bias_regs->initialize != OCCP_SUCCESS_RESULT) {
+		printk(KERN_ERR "%s: ERROR: probe(): OpenCPI worker initialization failure for BIAS worker\n", driver_name);
+		err = -1;
+	}
+
+	if(nf10_ctrl->initialize != OCCP_SUCCESS_RESULT) {
+		printk(KERN_ERR "%s: ERROR: probe(): OpenCPI worker initialization failure for NF10 worker\n", driver_name);
+		err = -1;
+	}
+
+	if(err) {
+		dma_free_coherent(&pdev->dev, dma_region_size, rx_dma_reg_va, rx_dma_reg_pa);
+		dma_free_coherent(&pdev->dev, dma_region_size, tx_dma_reg_va, tx_dma_reg_pa);
+		iounmap(bar0_base_va);
+		pci_release_region(pdev, BAR_0);
+		pci_disable_device(pdev);
+		
+		return err;
+	}
+
+	mb();
+
+	/* Configure workers. */
+	*sma0_props = 1;
+	*bias_props = 0;
+	*sma1_props = 2;
+	tx_dma_stream.buffers = (uint8_t *)tx_dma_reg_va;
+	tx_dma_stream.metadata = (OcdpMetadata *)(tx_dma_stream.buffers + dma_cpu_bufs * DMA_BUF_SIZE);
+	tx_dma_stream.flags = (volatile uint32_t *)(tx_dma_stream.metadata + dma_cpu_bufs);
+	tx_dma_stream.doorbell = (volatile uint32_t *)&dp0_props->nRemoteDone;
+	tx_dma_stream.buf_index = 0;
+
+	memset((void*)tx_dma_stream.flags, 1, dma_cpu_bufs * sizeof(uint32_t));
+	dp0_props->nLocalBuffers = DMA_FPGA_BUFS;
+	dp0_props->nRemoteBuffers = dma_cpu_bufs;
+	dp0_props->localBufferBase = 0;
+	dp0_props->localMetadataBase = DMA_FPGA_BUFS * DMA_BUF_SIZE;
+	dp0_props->localBufferSize = DMA_BUF_SIZE;
+	dp0_props->localMetadataSize = sizeof(OcdpMetadata);
+	dp0_props->memoryBytes = 32*1024; /* FIXME: What is this?? */
+	dp0_props->remoteBufferBase = (uint32_t)tx_dma_reg_pa;
+	dp0_props->remoteMetadataBase = (uint32_t)tx_dma_reg_pa + dma_cpu_bufs * DMA_BUF_SIZE;
+	dp0_props->remoteBufferSize = DMA_BUF_SIZE;
+	dp0_props->remoteMetadataSize = sizeof(OcdpMetadata);
+	dp0_props->remoteFlagBase = (uint32_t)tx_dma_reg_pa + (DMA_BUF_SIZE + sizeof(OcdpMetadata)) * dma_cpu_bufs;
+	dp0_props->remoteFlagPitch = sizeof(uint32_t);
+	dp0_props->control = OCDP_CONTROL(OCDP_CONTROL_CONSUMER, OCDP_ACTIVE_MESSAGE);
+	rx_dma_stream.buffers = (uint8_t *)rx_dma_reg_va;
+	rx_dma_stream.metadata = (OcdpMetadata *)(rx_dma_stream.buffers + dma_cpu_bufs * DMA_BUF_SIZE);
+	rx_dma_stream.flags = (volatile uint32_t *)(rx_dma_stream.metadata + dma_cpu_bufs);
+	rx_dma_stream.doorbell = (volatile uint32_t *)&dp1_props->nRemoteDone;
+	rx_dma_stream.buf_index = 0;
+
+	memset((void*)rx_dma_stream.flags, 0, dma_cpu_bufs * sizeof(uint32_t));
+	dp1_props->nLocalBuffers = DMA_FPGA_BUFS;
+	dp1_props->nRemoteBuffers = dma_cpu_bufs;
+	dp1_props->localBufferBase = 0;
+	dp1_props->localMetadataBase = DMA_FPGA_BUFS * DMA_BUF_SIZE;
+	dp1_props->localBufferSize = DMA_BUF_SIZE;
+	dp1_props->localMetadataSize = sizeof(OcdpMetadata);
+	dp1_props->memoryBytes = 32*1024; /* FIXME: What is this?? */
+	dp1_props->remoteBufferBase = (uint32_t)rx_dma_reg_pa;
+	dp1_props->remoteMetadataBase = (uint32_t)rx_dma_reg_pa + dma_cpu_bufs * DMA_BUF_SIZE;
+	dp1_props->remoteBufferSize = DMA_BUF_SIZE;
+	dp1_props->remoteMetadataSize = sizeof(OcdpMetadata);
+	dp1_props->remoteFlagBase = (uint32_t)rx_dma_reg_pa + (DMA_BUF_SIZE + sizeof(OcdpMetadata)) * dma_cpu_bufs;
+	dp1_props->remoteFlagPitch = sizeof(uint32_t);
+	dp1_props->control = OCDP_CONTROL(OCDP_CONTROL_PRODUCER, OCDP_ACTIVE_MESSAGE);
+
+	mb();
+	PDEBUG("probe(): configured dataplane OCPI workers:\n"
+	"\tTX path dataplane properties (dp0, worker %d):\n"
+	"\t\tnLocalBuffers:\t\t%d\n"
+	"\t\tnRemoteBuffers:\t\t%d\n"
+	"\t\tlocalBufferBase:\t0x%08x\n"
+	"\t\tlocalMetadataBase:\t0x%08x\n"
+	"\t\tlocalBufferSize:\t%d\n"
+	"\t\tlocalMetadataSize:\t%d\n"
+	"\t\tmemoryBytes:\t\t%d\n"
+	"\t\tremoteBufferBase:\t0x%08x\n"
+	"\t\tremoteMetadataBase:\t0x%08x\n"
+	"\t\tremoteBufferSize:\t%d\n"
+	"\t\tremoteMetadataSize:\t%d\n"
+	"\t\tremoteFlagBase:\t\t0x%08x\n"
+	"\t\tremoteFlagPitch:\t%d\n"
+	"\tRX path dataplane properties (dp1, worker %d):\n"
+	"\t\tnLocalBuffers:\t\t%d\n"
+	"\t\tnRemoteBuffers:\t\t%d\n"
+	"\t\tlocalBufferBase:\t0x%08x\n"
+	"\t\tlocalMetadataBase:\t0x%08x\n"
+	"\t\tlocalBufferSize:\t%d\n"
+	"\t\tlocalMetadataSize:\t%d\n"
+	"\t\tmemoryBytes:\t\t%d\n"
+	"\t\tremoteBufferBase:\t0x%08x\n"
+	"\t\tremoteMetadataBase:\t0x%08x\n"
+	"\t\tremoteBufferSize:\t%d\n"
+	"\t\tremoteMetadataSize:\t%d\n"
+	"\t\tremoteFlagBase:\t\t0x%08x\n"
+	"\t\tremoteFlagPitch:\t%d\n",
+	WORKER_DP0,
+	dp0_props->nLocalBuffers,
+	dp0_props->nRemoteBuffers,
+	dp0_props->localBufferBase,
+	dp0_props->localMetadataBase,
+	dp0_props->localBufferSize,
+	dp0_props->localMetadataSize,
+	dp0_props->memoryBytes,
+	dp0_props->remoteBufferBase,
+	dp0_props->remoteMetadataBase,
+	dp0_props->remoteBufferSize,
+	dp0_props->remoteMetadataSize,
+	dp0_props->remoteFlagBase,
+	dp0_props->remoteFlagPitch,
+	WORKER_DP1,
+	dp1_props->nLocalBuffers,
+	dp1_props->nRemoteBuffers,
+	dp1_props->localBufferBase,
+	dp1_props->localMetadataBase,
+	dp1_props->localBufferSize,
+	dp1_props->localMetadataSize,
+	dp1_props->memoryBytes,
+	dp1_props->remoteBufferBase,
+	dp1_props->remoteMetadataBase,
+	dp1_props->remoteBufferSize,
+	dp1_props->remoteMetadataSize,
+	dp1_props->remoteFlagBase,
+	dp1_props->remoteFlagPitch);
+
+	/* Start workers. */
+	if(dp0_regs->start != OCCP_SUCCESS_RESULT) {
+		printk(KERN_ERR "%s: ERROR: probe(): OpenCPI worker start failure for DP0\n", driver_name);
+		err = -1;
+	}
+
+	if(dp1_regs->start != OCCP_SUCCESS_RESULT) {
+		printk(KERN_ERR "%s: ERROR: probe(): OpenCPI worker start failure for DP1\n", driver_name);
+		err = -1;
+	}
+
+	if(sma0_regs->start != OCCP_SUCCESS_RESULT) {
+		printk(KERN_ERR "%s: ERROR: probe(): OpenCPI worker start failure for SMA0\n", driver_name);
+		err = -1;
+	}
+
+	if(sma1_regs->start != OCCP_SUCCESS_RESULT) {
+		printk(KERN_ERR "%s: ERROR: probe(): OpenCPI worker start failure for SMA1\n", driver_name);
+		err = -1;
+	}
+
+	if(bias_regs->start != OCCP_SUCCESS_RESULT) {
+		printk(KERN_ERR "%s: ERROR: probe(): OpenCPI worker start failure for bias worker\n", driver_name);
+		err = -1;
+	}
+
+	if(nf10_ctrl->start != OCCP_SUCCESS_RESULT) {
+		printk(KERN_ERR "%s: ERROR: probe(): OpenCPI worker start failure for nf10 worker\n", driver_name);
+		err = -1;
+	}
+
+	if(err) {
+		dma_free_coherent(&pdev->dev, dma_region_size, rx_dma_reg_va, rx_dma_reg_pa);
+		dma_free_coherent(&pdev->dev, dma_region_size, tx_dma_reg_va, tx_dma_reg_pa);
+		iounmap(bar0_base_va);
+		pci_release_region(pdev, BAR_0);
+		pci_disable_device(pdev);
+
+		return err;
+	}
+
+	/* Hardware has been successfully initialized. */
+	hw_state |= HW_INIT;
+	
+	/* Start the polling timer for receiving packets. */
+	rx_poll_timer.expires = jiffies + RX_POLL_INTERVAL;
+	
+	add_timer(&rx_poll_timer);
+	
+	return err;
 }
 
 
