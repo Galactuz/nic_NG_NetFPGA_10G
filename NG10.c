@@ -61,6 +61,10 @@
 #include "ocdp.h"
 #include "occp.h"
 
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Pavel Teixeira");
+MODULE_DESCRIPTION("ng10 nic driver");
+
 /* Length definitions */
 //#define mac_addr_len                    6
 #define RX_POLL_WEIGHT					64
@@ -208,7 +212,7 @@ static struct pci_device_id id_table[] = {
 MODULE_DEVICE_TABLE(pci, id_table);
 
 static struct pci_driver eth_pci_driver = {
-    .name       = "eth_driver: pci_driver",
+    .name       = "Eth_driver: pci_driver",
     .id_table   = id_table,
     .probe      = probe,
     .remove     = remove,
@@ -401,54 +405,18 @@ int ng_header(struct sk_buff *skb, struct net_device *dev,
 	return (dev->hard_header_len);
 }
 
-
-static void Eth_setup(struct net_device *dev)
-{
-	//char mac_addr[mac_addr_len+1];
-	pr_info("Eth_setup(%s)\n", dev->name);
-
-	/* Fill in the MAC address with a phoney */
-
-	//for (j = 0; j < ETH_ALEN; ++j) {
-	//	dev->dev_addr[j] = (char)j;
-	//}
-
-	/* request_region(), request_irq(),...
-	 *
-	 * Assign the hardware address of the board: use "\oSNULx", where
-	 * x is  0 or 1. The first byte is '\0' to avoid being a multicast
-	 * address (the first byte of multicast addrs is odd).
-	 */
-
-    	//mac_addr_len = device->addr_len;
-
-        //memset(mac_addr, 0, mac_addr_len+1);
-	//snprintf(&mac_addr, mac_addr_len, "NF%d", 0);
-        //memcpy(device->dev_addr, mac_addr, mac_addr_len);
-
-
-
-	//memcpy(dev->dev_addr, "\0SNUL0", ETH_LEN);
-	//if (dev == device)
-	//	dev->dev_addr[ETH_LEN-1]++; /* \OSNUL1 */
-
-	ether_setup(dev);
-
-	dev->netdev_ops = &ndo;
-	dev->flags |= IFF_NOARP;
-	stats = &dev->stats;
-
-	/*
-	 * Just for laughs, let's claim that we've seen 50 collisions.
-	 */
-	stats->collisions = 50;
-}
-
 void Eth_netdev_init(struct net_device *netdev) {
-	printk(KERN_DEBUG "Eth_netdev_init(): Initializing Eth_netdev.\n");
+	
+	printk(KERN_DEBUG "Eth_netdev_init(%s): Initializing Eth_netdev.\n", netdev->name);
+	
 	ether_setup(netdev);
-	netdev->netdev_ops  = &ndo;;
-    netdev->watchdog_timeo = 5 * HZ;
+	netdev->netdev_ops  	= 		&ndo;
+	netdev->flags 			|= 		IFF_NOARP;
+	stats 					= 		&netdev->stats;
+	stats->collisions		= 		50;
+    //netdev->watchdog_timeo 	= 		5 * HZ;
+
+    return;
 }
 
 static int __init Eth_driver_init(void) {
@@ -462,14 +430,15 @@ static int __init Eth_driver_init(void) {
 
 	/* Allocating the net devices. */
 	for (i = 0; i <NUM_NETDEVS; i++) {
-		device[i] = alloc_netdev(0, "Eth%d", Eth_setup);
+		device[i] = alloc_netdev(0, "Eth%d", Eth_netdev_init);
 		if(device[i] == NULL) {
 			printk(KERN_ERR "Eth_Driver: ERROR: Eth_driver_init(): failed to allocate net_device %d... unloading driver\n", i);
 
 			for (i = i-1; i >= 0; i--)
 				free_netdev(device[i]);
 
-			//pci_unregister_driver(&eth_pci_driver);
+			pci_unregister_driver(&eth_pci_driver);
+			
 			return -ENOMEM;
 		}
 	}
@@ -510,7 +479,8 @@ static int __init Eth_driver_init(void) {
     		for (i = 0; i < NUM_NETDEVS; i++)
     			free_netdev(device[i]);
 
-    		//pci_unregister_driver(&eth_pci_driver);
+    		pci_unregister_driver(&eth_pci_driver);
+    		
     		return err;
 		}
     }
@@ -519,7 +489,7 @@ static int __init Eth_driver_init(void) {
 
      /* FIXME: Do we need to check for error on create_proc_read_entry? */
 	//create_proc_read_entry("driver/Eth_driver", 0, NULL, read_proc, NULL);		THIS IS OBSOLETE NOW!
-	proc_create_data("driver/Eth_driver",0,NULL,&proc_fops,NULL);
+	proc_create_data("driver/NG10",0,NULL,&proc_fops,NULL);
 
 
     /* Enabling NAPI. */
@@ -542,10 +512,6 @@ static void __exit Eth_driver_exit(void) {
 
 	/* Strop the polling timer for receiving packets. */
 	/* TODO */
-
-	// err = genl_unregister_family(&eth_genl_family);
-	// if(err != 0)
-	// 	printk (KERN_ERR "Eth_Driver: ERROR: Eth_driver_exit(): failed to unregister GENL family\n");
 
 	for(i = 0; i < NUM_NETDEVS; i++)
 		unregister_netdev(device[i]);
@@ -594,16 +560,45 @@ struct eth_packet *Eth_get_tx_buffer(struct net_device *dev) {
 /*
 * Transmit a packet (low level interface)
 */
-
-
 int Eth_start_xmit(struct sk_buff *skb, struct net_device *dev) {
-	int len;
-	char *data, shortpkt[ETH_ZLEN];
-	struct eth_priv *priv = netdev_priv(dev);
+	int 			len;
+	char 			*data, shortpkt[ETH_ZLEN];
+	struct 			eth_priv *priv;
+	unsigned int  	opcode;
 
+	/* Geting data and length, then, send packet to the hardware. */
+	printk(KERN_INFO "Eth_start_xmit(): Transmitting packet\n");
+	priv = netdev_priv(dev);
 	data = (void*)skb->data;
 	len = skb->len;
+
+	// /* Check len against the bounds imposed by the raw hardware. */
+	// if(len < NF10_PKT_SIZE_MIN || len > NF10_PKT_SIZE_MAX){
+	// 	printk(KERN_ERR "%s: ERROR: Eth_start_xmit(): packet lenght %d out of the bounds supported by the hardware [%d, %d]. Droppingt the packet...\n", driver_name, len, NF10_PKT_SIZE_MIN, NF10_PKT_SIZE_MAX);
+	// 	dev->stats.tx_dropped++;
+	// 	dev_kfree_skb(skb);
+
+	// 	return NETDEV_TX_OK;
+	// }
 	
+	// /* Check lenght against the DMA buffer size. */
+	// if (len > DMA_BUF_SIZE){
+	// 	printk(KERN_ERR "%s: ERROR: Eth_start_xmit(): packet lenght %d greater than buffer size %d\n", driver_name, len, DMA_BUF_SIZE);
+	// 	dev->stats.tx_dropped++;
+	// 	dev_kfree_skb(skb);
+
+	// 	return NETDEV_TX_OK;
+	// }
+
+	// /* Check that the hardware is actually there and working. */
+	// if(!((hw_state & HW_FOUND) && (hw_state & HW_INIT))){
+	// 	printk(KERN_WARNING "%s: WARNING: Eth_start_xmit(): trying to send packet but hardware was not found or was not initialized properly... dropping\n", driver_name);
+	// 	dev->stats.tx_dropped++;
+	// 	dev_kfree_skb(skb);
+
+	// 	return NETDEV_TX_OK;
+	// }
+
 	if (len < ETH_ZLEN) {
 		memset(shortpkt, 0 , ETH_ZLEN);
 		memcpy(shortpkt, skb->data, skb->len);
@@ -706,6 +701,7 @@ void Eth_rx(struct net_device *dev, struct eth_packet *pkt) {
 		priv->stats.rx_dropped++;
 		goto out;
 	}
+
 	memcpy(skb_put(skb, pkt->datalen), pkt->data, pkt->datalen);	//No problems, so we can copy the packet to the buffer.
 
 	/* Write metadata, and then pass to the receive level */
