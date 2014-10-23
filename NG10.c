@@ -572,32 +572,32 @@ int Eth_start_xmit(struct sk_buff *skb, struct net_device *dev) {
 	data = (void*)skb->data;
 	len = skb->len;
 
-	// /* Check len against the bounds imposed by the raw hardware. */
-	// if(len < NF10_PKT_SIZE_MIN || len > NF10_PKT_SIZE_MAX){
-	// 	printk(KERN_ERR "%s: ERROR: Eth_start_xmit(): packet lenght %d out of the bounds supported by the hardware [%d, %d]. Droppingt the packet...\n", driver_name, len, NF10_PKT_SIZE_MIN, NF10_PKT_SIZE_MAX);
-	// 	dev->stats.tx_dropped++;
-	// 	dev_kfree_skb(skb);
+	/* Check len against the bounds imposed by the raw hardware. */
+	if(len < NF10_PKT_SIZE_MIN || len > NF10_PKT_SIZE_MAX){
+		printk(KERN_ERR "%s: ERROR: Eth_start_xmit(): packet lenght %d out of the bounds supported by the hardware [%d, %d]. Droppingt the packet...\n", driver_name, len, NF10_PKT_SIZE_MIN, NF10_PKT_SIZE_MAX);
+		dev->stats.tx_dropped++;
+		dev_kfree_skb(skb);
 
-	// 	return NETDEV_TX_OK;
-	// }
+		return NETDEV_TX_OK;
+	}
 	
-	// /* Check lenght against the DMA buffer size. */
-	// if (len > DMA_BUF_SIZE){
-	// 	printk(KERN_ERR "%s: ERROR: Eth_start_xmit(): packet lenght %d greater than buffer size %d\n", driver_name, len, DMA_BUF_SIZE);
-	// 	dev->stats.tx_dropped++;
-	// 	dev_kfree_skb(skb);
+	/* Check lenght against the DMA buffer size. */
+	if (len > DMA_BUF_SIZE){
+		printk(KERN_ERR "%s: ERROR: Eth_start_xmit(): packet lenght %d greater than buffer size %d\n", driver_name, len, DMA_BUF_SIZE);
+		dev->stats.tx_dropped++;
+		dev_kfree_skb(skb);
 
-	// 	return NETDEV_TX_OK;
-	// }
+		return NETDEV_TX_OK;
+	}
 
-	// /* Check that the hardware is actually there and working. */
-	// if(!((hw_state & HW_FOUND) && (hw_state & HW_INIT))){
-	// 	printk(KERN_WARNING "%s: WARNING: Eth_start_xmit(): trying to send packet but hardware was not found or was not initialized properly... dropping\n", driver_name);
-	// 	dev->stats.tx_dropped++;
-	// 	dev_kfree_skb(skb);
+	/* Check that the hardware is actually there and working. */
+	if(!((hw_state & HW_FOUND) && (hw_state & HW_INIT))){
+		printk(KERN_WARNING "%s: WARNING: Eth_start_xmit(): trying to send packet but hardware was not found or was not initialized properly... dropping\n", driver_name);
+		dev->stats.tx_dropped++;
+		dev_kfree_skb(skb);
 
-	// 	return NETDEV_TX_OK;
-	// }
+		return NETDEV_TX_OK;
+	}
 
 	if (len < ETH_ZLEN) {
 		memset(shortpkt, 0 , ETH_ZLEN);
